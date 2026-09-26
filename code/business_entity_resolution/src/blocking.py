@@ -6,7 +6,7 @@ multiple independent blocking strategies are OR-ed together.
 """
 
 from __future__ import annotations
-
+from itertools import combinations
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -43,17 +43,19 @@ MIN_ADDRESS_TOKEN_LENGTH = 4
 
 MAX_RARE_ADDRESS_TOKEN_FREQUENCY = 500
 MAX_RARE_ADDRESS_NUMBER_FREQUENCY = 50
-
+MAX_ADDRESS_NUMBER_PAIR_FREQUENCY = 50
 MAX_FINAL_TOKEN_BLOCK_FREQUENCY = 500
 MAX_FINAL_ADDRESS_TOKEN_BLOCK_FREQUENCY = 500
+MAX_NAME_NGRAM_PAIR_FREQUENCY = 50
 
 # New: allow useful combinations even when individual
 # address tokens are not rare.
-MAX_ADDRESS_PAIR_FREQUENCY = 250
+MAX_ADDRESS_PAIR_FREQUENCY = 700
 
 # New: number + location combination limit.
 MAX_ADDRESS_NUMBER_LOCATION_FREQUENCY = 250
 MAX_LEETSPEAK_NAME_FREQUENCY = 150
+MAX_GEOGRAPHIC_PAIR_FREQUENCY = 700
 
 # ------------------------------------------------------------
 # Name frequency limits
@@ -339,6 +341,18 @@ def _name_ngrams(
         )
     }
 
+def _name_ngram_pairs(name: object) -> Set[str]:
+    ngrams = sorted(set(_name_ngrams(name)))
+
+    if len(ngrams) < 2:
+        return set()
+
+    pairs: Set[str] = set()
+
+    for first, second in combinations(ngrams, 2):
+        pairs.add(f"{first}|{second}")
+
+    return pairs
 
 # ============================================================
 # Address utilities
@@ -385,7 +399,7 @@ def extract_address_numbers(address: object) -> tuple[str, ...]:
 
         # Compound address number.
         compound = re.fullmatch(
-            r"0*(\d+)/0*(\d+)([a-z])?",
+            r"0*(\d+)[/-]0*(\d+)([a-z])?",
             token,
         )
 
@@ -430,19 +444,28 @@ def _address_numbers(row: pd.Series) -> tuple[str, ...]:
     text = _safe_string(value)
 
     if text:
-        return tuple(
+        tokens = tuple(
             token
             for token in text.split()
             if token
         )
-
-    return extract_address_numbers(
-        row.get(
-            "address_normalized",
-            "",
+    else:
+        tokens = extract_address_numbers(
+            row.get(
+                "address_normalized",
+                "",
+            )
         )
-    )
 
+    # Also recognize adjacent numeric tokens such as
+    # "1 76" as the combined address number "176".
+    numbers = set(tokens)
+
+    for first, second in zip(tokens, tokens[1:]):
+        if first.isdigit() and second.isdigit():
+            numbers.add(f"{first}{second}")
+
+    return tuple(numbers)
 
 def _address_base_numbers(row: pd.Series) -> tuple[str, ...]:
     """
@@ -722,6 +745,19 @@ def _build_name_ngram_frequency(
 
     return frequency
 
+def _build_name_ngram_pair_frequency(
+    target_df: pd.DataFrame,
+) -> Counter:
+
+    frequency = Counter()
+
+    for name in target_df["name_core"]:
+        pairs = _name_ngram_pairs(name)
+
+        for pair in pairs:
+            frequency[pair] += 1
+
+    return frequency
 
 def _build_leetspeak_name_frequency(
     target_df: pd.DataFrame,
@@ -874,6 +910,21 @@ def _rare_name_ngrams(
         <= MAX_RARE_NAME_NGRAM_FREQUENCY
     ]
 
+def _rare_name_ngram_pairs(
+    name: object,
+    frequency: Counter,
+) -> List[str]:
+
+    pairs = _name_ngram_pairs(name)
+
+    return [
+        pair
+        for pair in pairs
+        if frequency.get(
+            pair,
+            0,
+        ) <= MAX_NAME_NGRAM_PAIR_FREQUENCY
+    ]
 
 def _final_recall_keys(
     name_core: str,
@@ -979,9 +1030,11 @@ def generate_block_keys(
     address_number_frequency: Counter | None = None,
     name_token_frequency: Counter | None = None,
     name_ngram_frequency: Counter | None = None,
+    name_ngram_pair_frequency: Counter | None = None,
     address_pair_frequency: Counter | None = None,
     address_number_location_frequency: Counter | None = None,
     leetspeak_name_frequency: Counter | None = None,
+    
 ) -> Set[str]:
 
     country = _safe_string(
@@ -1172,6 +1225,28 @@ def generate_block_keys(
                 f"{country}::{ngram}"
             )
 
+    # --------------------------------------------------------
+    # 6b. Rare character n-gram pairs
+    # --------------------------------------------------------
+
+    if (
+        country
+        and name_ngram_pair_frequency is not None
+    ):
+
+        rare_pairs = _rare_name_ngram_pairs(
+            name_core or name,
+            name_ngram_pair_frequency,
+        )
+
+        for pair in rare_pairs:
+
+            keys.add(
+                "country_name_ngram_pair::"
+                f"{country}::{pair}"
+            )
+            
+
     # ========================================================
     # ADDRESS BLOCKING
     # ========================================================
@@ -1339,6 +1414,7 @@ def build_block_index(
     address_number_frequency: Counter | None = None,
     name_token_frequency: Counter | None = None,
     name_ngram_frequency: Counter | None = None,
+    name_ngram_pair_frequency: Counter | None = None,
     address_pair_frequency: Counter | None = None,
     address_number_location_frequency: Counter | None = None,
     leetspeak_name_frequency: Counter | None = None,
@@ -1381,6 +1457,14 @@ def build_block_index(
                 source_df
             )
         )
+
+    if name_ngram_pair_frequency is None:
+
+        name_ngram_pair_frequency = (
+            _build_name_ngram_pair_frequency(
+                source_df
+            )
+        )    
 
     if address_pair_frequency is None:
 
@@ -1438,6 +1522,9 @@ def build_block_index(
             ),
             name_ngram_frequency=(
                 name_ngram_frequency
+            ),
+            name_ngram_pair_frequency=(
+                name_ngram_pair_frequency
             ),
             address_pair_frequency=(
                 address_pair_frequency
@@ -1505,6 +1592,12 @@ def generate_candidate_pairs(
         )
     )
 
+    name_ngram_pair_frequency = (
+        _build_name_ngram_pair_frequency(
+            target_df
+        )
+    )
+
     address_pair_frequency = (
         _build_address_pair_frequency(
             target_df
@@ -1540,6 +1633,9 @@ def generate_candidate_pairs(
         ),
         name_ngram_frequency=(
             name_ngram_frequency
+        ),
+        name_ngram_pair_frequency=(
+            name_ngram_pair_frequency
         ),
         address_pair_frequency=(
             address_pair_frequency
@@ -1587,6 +1683,9 @@ def generate_candidate_pairs(
             ),
             name_ngram_frequency=(
                 name_ngram_frequency
+            ),
+            name_ngram_pair_frequency=(
+                name_ngram_pair_frequency
             ),
             address_pair_frequency=(
                 address_pair_frequency
