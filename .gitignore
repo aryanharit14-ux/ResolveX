@@ -19,3 +19,5 @@ output/*.tsv
 
 # Challenge datasets
 dataset/
+
+.ipynb_checkpoints/
