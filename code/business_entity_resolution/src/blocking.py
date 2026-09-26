@@ -41,24 +41,31 @@ MIN_ADDRESS_TOKEN_LENGTH = 4
 # Address frequency limits
 # ------------------------------------------------------------
 
-MAX_RARE_ADDRESS_TOKEN_FREQUENCY = 50
-
+MAX_RARE_ADDRESS_TOKEN_FREQUENCY = 500
 MAX_RARE_ADDRESS_NUMBER_FREQUENCY = 50
 
+MAX_FINAL_TOKEN_BLOCK_FREQUENCY = 500
+MAX_FINAL_ADDRESS_TOKEN_BLOCK_FREQUENCY = 500
+
+# New: allow useful combinations even when individual
+# address tokens are not rare.
+MAX_ADDRESS_PAIR_FREQUENCY = 250
+
+# New: number + location combination limit.
+MAX_ADDRESS_NUMBER_LOCATION_FREQUENCY = 250
+MAX_LEETSPEAK_NAME_FREQUENCY = 150
 
 # ------------------------------------------------------------
 # Name frequency limits
 # ------------------------------------------------------------
 
-# Only use an individual name token when it is relatively rare
-# in the target source.
 MAX_RARE_NAME_TOKEN_FREQUENCY = 100
-
-
-# Only use character n-grams that are relatively rare.
 MAX_RARE_NAME_NGRAM_FREQUENCY = 100
 
 NAME_NGRAM_SIZE = 3
+
+# New controlled name-prefix rule.
+MIN_NAME_PREFIX_LENGTH = 4
 
 
 # ============================================================
@@ -178,22 +185,73 @@ def _name_token_key(name: object) -> str:
     return "|".join(sorted(tokens[:2]))
 
 
-# ------------------------------------------------------------
+def _name_prefix_key(name: object) -> str:
+    """
+    Return the first useful name token.
+
+    Examples:
+        Williams Silicon
+            -> williams
+
+        Global Institute
+            -> global
+
+        Sunrise Tech
+            -> sunrise
+    """
+
+    tokens = _informative_name_tokens(name)
+
+    if not tokens:
+        return ""
+
+    for token in tokens:
+        token = token.casefold()
+
+        if len(token) >= MIN_NAME_PREFIX_LENGTH:
+            return token
+
+    return ""
+
+
+def _name_subset_key(name: object) -> str:
+    """
+    Return the first two informative name tokens.
+
+    Examples:
+
+        Sunrise Tech
+        Sunrise Tech Limited Service
+
+    both produce:
+
+        sunrise|tech
+    """
+
+    tokens = _informative_name_tokens(name)
+
+    if not tokens:
+        return ""
+
+    tokens = [
+        token.casefold()
+        for token in tokens
+        if len(token) >= MIN_NAME_TOKEN_LENGTH
+    ]
+
+    if not tokens:
+        return ""
+
+    return "|".join(tokens[:2])
+
+
+# ============================================================
 # Accent folding
-# ------------------------------------------------------------
+# ============================================================
 
 def _accent_fold(value: object) -> str:
     """
     Create an accent-insensitive representation.
-
-    Examples:
-
-        NÉXTERA -> NEXTERA
-        Tráding -> Trading
-        Límited -> Limited
-
-    This is used only for blocking.
-    The original normalized columns are not modified.
     """
 
     text = _safe_string(value)
@@ -217,8 +275,7 @@ def _accent_fold_name(value: object) -> str:
     """
     Create a compact accent-insensitive name key.
 
-    Spaces/punctuation are removed so that small formatting
-    differences do not prevent a block.
+    Spaces/punctuation are removed.
     """
 
     text = _accent_fold(value)
@@ -232,10 +289,32 @@ def _accent_fold_name(value: object) -> str:
         if char.isalnum()
     )
 
+def _leetspeak_name(value: object) -> str:
+    """
+    Create a compact leetspeak-normalized name key.
 
-# ------------------------------------------------------------
+    Common OCR/typing substitutions are normalized.
+    """
+
+    text = _accent_fold_name(value)
+
+    if not text:
+        return ""
+
+    replacements = str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+    })
+
+    return text.translate(replacements)
+
+# ============================================================
 # Name character n-grams
-# ------------------------------------------------------------
+# ============================================================
 
 def _name_ngrams(
     name: object,
@@ -243,20 +322,6 @@ def _name_ngrams(
 ) -> Set[str]:
     """
     Generate character n-grams from a business name.
-
-    Example:
-
-        "silicon"
-
-    produces:
-
-        sil
-        ili
-        lic
-        ico
-        con
-
-    N-grams are generated from a compact representation.
     """
 
     compact = _accent_fold_name(name)
@@ -298,7 +363,7 @@ def _informative_address_tokens(address: object) -> List[str]:
 
 def extract_address_numbers(address: object) -> tuple[str, ...]:
     """
-    Extract address numbers.
+    Extract normalized address numbers.
 
     Supports:
 
@@ -318,7 +383,7 @@ def extract_address_numbers(address: object) -> tuple[str, ...]:
 
     for token in text.casefold().split():
 
-        # Compound address number such as 142/4 or 142/4a.
+        # Compound address number.
         compound = re.fullmatch(
             r"0*(\d+)/0*(\d+)([a-z])?",
             token,
@@ -332,9 +397,10 @@ def extract_address_numbers(address: object) -> tuple[str, ...]:
             values.append(
                 f"{first}/{second}{suffix}"
             )
+
             continue
 
-        # Normal number such as 3841 or 3841c.
+        # Normal number.
         match = re.fullmatch(
             r"0*(\d+)([a-z])?",
             token,
@@ -371,7 +437,10 @@ def _address_numbers(row: pd.Series) -> tuple[str, ...]:
         )
 
     return extract_address_numbers(
-        row.get("address_normalized", "")
+        row.get(
+            "address_normalized",
+            "",
+        )
     )
 
 
@@ -383,9 +452,7 @@ def _address_base_numbers(row: pd.Series) -> tuple[str, ...]:
         100a  -> 100
         7130c -> 7130
 
-    Compound numbers remain compound:
-
-        142/4 -> 142/4
+    Compound numbers remain compound.
     """
 
     numbers = _address_numbers(row)
@@ -403,6 +470,13 @@ def _address_base_numbers(row: pd.Series) -> tuple[str, ...]:
             bases.append(
                 f"{compound.group(1)}/{compound.group(2)}"
             )
+
+            # Also retain the first component of a compound
+            # address number for more flexible matching.
+            bases.append(
+                compound.group(1)
+            )
+
             continue
 
         normal = re.fullmatch(
@@ -429,6 +503,90 @@ def _address_pair_key(address: object) -> str:
     return "|".join(selected)
 
 
+def _address_token_pairs(
+    address: object,
+) -> Set[str]:
+    """
+    Generate several informative address-token pairs.
+
+    Only the strongest six address tokens are considered
+    to prevent uncontrolled candidate explosion.
+    """
+
+    tokens = _informative_address_tokens(address)
+
+    if len(tokens) < 2:
+        return set()
+
+    selected = tokens[:6]
+
+    pairs: Set[str] = set()
+
+    for i in range(len(selected)):
+        for j in range(i + 1, len(selected)):
+
+            first = selected[i]
+            second = selected[j]
+
+            pairs.add(
+                "|".join(
+                    sorted(
+                        [
+                            first,
+                            second,
+                        ]
+                    )
+                )
+            )
+
+    return pairs
+
+
+def _address_number_location_pairs(
+    row: pd.Series,
+) -> Set[str]:
+    """
+    Generate address-number + address-token combinations.
+
+    Example:
+
+        402, Thane, Maharashtra
+
+    creates combinations such as:
+
+        402|thane
+        402|maharashtra
+    """
+
+    numbers = _address_base_numbers(row)
+
+    address = _safe_string(
+        row.get(
+            "address_normalized",
+            "",
+        )
+    )
+
+    tokens = _informative_address_tokens(
+        address
+    )
+
+    if not numbers or not tokens:
+        return set()
+
+    pairs: Set[str] = set()
+
+    for number in numbers:
+
+        for token in tokens:
+
+            pairs.add(
+                f"{number}|{token}"
+            )
+
+    return pairs
+
+
 # ============================================================
 # Frequency analysis
 # ============================================================
@@ -436,9 +594,12 @@ def _address_pair_key(address: object) -> str:
 def _build_address_token_frequency(
     target_df: pd.DataFrame,
 ) -> Counter:
+
     frequency = Counter()
 
-    for address in target_df["address_normalized"]:
+    for address in target_df[
+        "address_normalized"
+    ]:
 
         tokens = set(
             _informative_address_tokens(address)
@@ -453,20 +614,6 @@ def _build_address_token_frequency(
 def _build_address_number_frequency(
     target_df: pd.DataFrame,
 ) -> Counter:
-    """
-    Count how many target records contain each BASE
-    address number.
-
-    Example:
-
-        908
-        908C
-        908A
-
-    all contribute to:
-
-        908
-    """
 
     frequency = Counter()
 
@@ -474,10 +621,8 @@ def _build_address_number_frequency(
         index=False
     ):
 
-        row_dict = row._asdict()
-
         row_series = pd.Series(
-            row_dict
+            row._asdict()
         )
 
         numbers = _address_base_numbers(
@@ -490,54 +635,107 @@ def _build_address_number_frequency(
     return frequency
 
 
-# ------------------------------------------------------------
-# Name token frequency
-# ------------------------------------------------------------
+def _build_address_pair_frequency(
+    target_df: pd.DataFrame,
+) -> Counter:
+
+    frequency = Counter()
+
+    for address in target_df[
+        "address_normalized"
+    ]:
+
+        pairs = _address_token_pairs(
+            address
+        )
+
+        for pair in pairs:
+            frequency[pair] += 1
+
+    return frequency
+
+
+def _build_address_number_location_frequency(
+    target_df: pd.DataFrame,
+) -> Counter:
+
+    frequency = Counter()
+
+    for row in target_df.itertuples(
+        index=False
+    ):
+
+        row_series = pd.Series(
+            row._asdict()
+        )
+
+        pairs = _address_number_location_pairs(
+            row_series
+        )
+
+        for pair in pairs:
+            frequency[pair] += 1
+
+    return frequency
+
+
+# ============================================================
+# Name frequency
+# ============================================================
 
 def _build_name_token_frequency(
     target_df: pd.DataFrame,
 ) -> Counter:
-    """
-    Count how many target records contain each
-    informative name token.
-    """
 
     frequency = Counter()
 
-    for name in target_df["name_core"]:
+    for name in target_df[
+        "name_core"
+    ]:
 
         tokens = set(
             _informative_name_tokens(name)
         )
 
         for token in tokens:
-            frequency[token.casefold()] += 1
+            frequency[
+                token.casefold()
+            ] += 1
 
     return frequency
 
 
-# ------------------------------------------------------------
-# Name n-gram frequency
-# ------------------------------------------------------------
-
 def _build_name_ngram_frequency(
     target_df: pd.DataFrame,
 ) -> Counter:
-    """
-    Count how many target records contain each
-    character trigram.
-
-    Frequency is record-based rather than occurrence-based.
-    """
 
     frequency = Counter()
 
-    for name in target_df["name_core"]:
+    for name in target_df[
+        "name_core"
+    ]:
 
         ngrams = _name_ngrams(name)
 
         for ngram in ngrams:
             frequency[ngram] += 1
+
+    return frequency
+
+
+def _build_leetspeak_name_frequency(
+    target_df: pd.DataFrame,
+) -> Counter:
+    frequency = Counter()
+
+    for name in target_df[
+        "name_core"
+    ]:
+
+        leet_name = _leetspeak_name(name)
+
+        if leet_name:
+            frequency[leet_name] += 1
 
     return frequency
 
@@ -551,12 +749,17 @@ def _rare_address_tokens(
     address_token_frequency: Counter,
 ) -> List[str]:
 
-    tokens = _informative_address_tokens(address)
+    tokens = _informative_address_tokens(
+        address
+    )
 
     return [
         token
         for token in tokens
-        if address_token_frequency.get(token, 0)
+        if address_token_frequency.get(
+            token,
+            0,
+        )
         <= MAX_RARE_ADDRESS_TOKEN_FREQUENCY
     ]
 
@@ -571,8 +774,51 @@ def _rare_address_numbers(
     return [
         number
         for number in numbers
-        if address_number_frequency.get(number, 0)
+        if address_number_frequency.get(
+            number,
+            0,
+        )
         <= MAX_RARE_ADDRESS_NUMBER_FREQUENCY
+    ]
+
+
+def _rare_address_token_pairs(
+    address: object,
+    address_pair_frequency: Counter,
+) -> List[str]:
+
+    pairs = _address_token_pairs(
+        address
+    )
+
+    return [
+        pair
+        for pair in pairs
+        if address_pair_frequency.get(
+            pair,
+            0,
+        )
+        <= MAX_ADDRESS_PAIR_FREQUENCY
+    ]
+
+
+def _rare_address_number_location_pairs(
+    row: pd.Series,
+    frequency: Counter,
+) -> List[str]:
+
+    pairs = _address_number_location_pairs(
+        row
+    )
+
+    return [
+        pair
+        for pair in pairs
+        if frequency.get(
+            pair,
+            0,
+        )
+        <= MAX_ADDRESS_NUMBER_LOCATION_FREQUENCY
     ]
 
 
@@ -584,12 +830,10 @@ def _rare_name_tokens(
     name: object,
     name_token_frequency: Counter,
 ) -> List[str]:
-    """
-    Return individual name tokens that are rare enough
-    to safely use as blocking keys.
-    """
 
-    tokens = _informative_name_tokens(name)
+    tokens = _informative_name_tokens(
+        name
+    )
 
     result = []
 
@@ -617,15 +861,6 @@ def _rare_name_ngrams(
     name: object,
     name_ngram_frequency: Counter,
 ) -> List[str]:
-    """
-    Return rare character n-grams.
-
-    These are particularly useful for:
-
-        silicon -> siliino
-        properties -> prsoperties
-        immersive -> imcresrhvie
-    """
 
     ngrams = _name_ngrams(name)
 
@@ -640,6 +875,100 @@ def _rare_name_ngrams(
     ]
 
 
+def _final_recall_keys(
+    name_core: str,
+    name: str,
+    address_normalized: str,
+) -> set[str]:
+    """
+    Final high-recall blocking keys.
+
+    These keys are intentionally broad and are only used with
+    frequency limits in generate_block_keys().
+    """
+    keys: set[str] = set()
+
+    # ---------------------------------------------------------
+    # 1. Individual meaningful name tokens
+    #    Helps:
+    #    OV Foods <-> OV Private Foods
+    #    NS Consulting <-> NS Corp Consulting
+    #    QR Brothers <-> QR Private Limited Services
+    # ---------------------------------------------------------
+    name_tokens = {
+        token
+        for token in re.findall(r"[^\W\d_]+", name_core or name, flags=re.UNICODE)
+        if len(token) >= MIN_NAME_TOKEN_LENGTH
+    }
+
+    for token in name_tokens:
+        keys.add(f"final_name_token:{token}")
+
+    # ---------------------------------------------------------
+    # 2. Character trigrams from the complete normalized name
+    #    Helps small spelling/transposition errors.
+    # ---------------------------------------------------------
+    compact_name = re.sub(
+        r"[^\w]",
+        "",
+        _accent_fold_name(name_core or name),
+        flags=re.UNICODE,
+    )
+
+    if len(compact_name) >= 4:
+        for i in range(len(compact_name) - 2):
+            keys.add(
+                f"final_name_tri:{compact_name[i:i + 3]}"
+            )
+
+    # ---------------------------------------------------------
+    # 3. Address tokens
+    #    Helps multilingual names where address is the bridge.
+    # ---------------------------------------------------------
+    address_tokens = {
+        token
+        for token in re.findall(
+            r"[^\W\d_]+",
+            address_normalized or "",
+            flags=re.UNICODE,
+        )
+        if len(token) >= MIN_ADDRESS_TOKEN_LENGTH
+    }
+
+    for token in address_tokens:
+        keys.add(f"final_address_token:{token}")
+
+    # ---------------------------------------------------------
+    # 4. Numeric address fragments
+    #    Handles:
+    #       408 <-> 08
+    #       1410 <-> 14-10
+    #       207 2nd <-> 207 2th
+    # ---------------------------------------------------------
+    numbers = re.findall(
+        r"\d+[a-zA-Z]?",
+        address_normalized or "",
+    )
+
+    for number in numbers:
+        number = number.lower()
+
+        keys.add(f"final_address_number:{number}")
+
+        digits = re.sub(r"[^0-9]", "", number)
+
+        if len(digits) >= 2:
+            keys.add(
+                f"final_address_number_suffix:{digits[-2:]}"
+            )
+
+        if len(digits) >= 3:
+            keys.add(
+                f"final_address_number_suffix:{digits[-3:]}"
+            )
+
+    return keys
+
 # ============================================================
 # Blocking key generation
 # ============================================================
@@ -650,27 +979,10 @@ def generate_block_keys(
     address_number_frequency: Counter | None = None,
     name_token_frequency: Counter | None = None,
     name_ngram_frequency: Counter | None = None,
+    address_pair_frequency: Counter | None = None,
+    address_number_location_frequency: Counter | None = None,
+    leetspeak_name_frequency: Counter | None = None,
 ) -> Set[str]:
-    """
-    Generate independent blocking keys.
-
-    Strategies:
-
-    1.  Country + exact name
-    2.  Exact name
-    3.  Country + name core
-    4.  Name core
-    5.  Country + name token pair
-    6.  Country + accent-folded name
-    7.  Country + rare name token
-    8.  Country + rare name trigram
-    9.  Country + address number + token
-    10. Country + base address number + token
-    11. Country + address token pair
-    12. Country + rare address token
-    13. Country + rare address number
-    14. Country + rare address number + token
-    """
 
     country = _safe_string(
         row.get(
@@ -701,6 +1013,10 @@ def generate_block_keys(
     )
 
     keys: Set[str] = set()
+
+    # ========================================================
+    # NAME BLOCKING
+    # ========================================================
 
     # --------------------------------------------------------
     # 1. Exact normalized name
@@ -747,6 +1063,34 @@ def generate_block_keys(
         )
 
     # --------------------------------------------------------
+    # 3b. Name prefix
+    # --------------------------------------------------------
+
+    name_prefix = _name_prefix_key(
+        name_core or name
+    )
+
+    if country and name_prefix:
+
+        keys.add(
+            f"country_name_prefix::{country}::{name_prefix}"
+        )
+
+    # --------------------------------------------------------
+    # 3c. Name subset / first two tokens
+    # --------------------------------------------------------
+
+    name_subset = _name_subset_key(
+        name_core or name
+    )
+
+    if country and name_subset:
+
+        keys.add(
+            f"country_name_subset::{country}::{name_subset}"
+        )
+
+    # --------------------------------------------------------
     # 4. Accent-insensitive name
     # --------------------------------------------------------
 
@@ -759,6 +1103,32 @@ def generate_block_keys(
         keys.add(
             f"country_accent_name::{country}::{accent_name}"
         )
+
+    # --------------------------------------------------------
+    # 4b. Controlled leetspeak-normalized name
+    # --------------------------------------------------------
+
+    if (
+        country
+        and leetspeak_name_frequency is not None
+    ):
+
+        leet_name = _leetspeak_name(
+            name_core or name
+        )
+
+        if (
+            leet_name
+            and leetspeak_name_frequency.get(
+                leet_name,
+                0,
+            ) <= MAX_LEETSPEAK_NAME_FREQUENCY
+        ):
+
+            keys.add(
+                "country_leetspeak_name::"
+                f"{country}::{leet_name}"
+            )
 
     # --------------------------------------------------------
     # 5. Rare individual name tokens
@@ -802,9 +1172,9 @@ def generate_block_keys(
                 f"{country}::{ngram}"
             )
 
-    # --------------------------------------------------------
-    # 7. Address information
-    # --------------------------------------------------------
+    # ========================================================
+    # ADDRESS BLOCKING
+    # ========================================================
 
     address_numbers = _address_numbers(
         row
@@ -815,12 +1185,17 @@ def generate_block_keys(
     )
 
     informative_tokens = (
-        _informative_address_tokens(address)
+        _informative_address_tokens(
+            address
+        )
     )
+
+    # --------------------------------------------------------
+    # 7. Address number + token
+    # --------------------------------------------------------
 
     if country:
 
-        # Existing exact number + token strategy.
         for number in address_numbers:
 
             for token in informative_tokens[:3]:
@@ -830,7 +1205,10 @@ def generate_block_keys(
                     f"{country}::{number}::{token}"
                 )
 
-        # Base number + token strategy.
+        # ----------------------------------------------------
+        # Base number + token
+        # ----------------------------------------------------
+
         for base_number in address_base_numbers:
 
             for token in informative_tokens[:3]:
@@ -841,7 +1219,7 @@ def generate_block_keys(
                 )
 
     # --------------------------------------------------------
-    # 8. Address token pair
+    # 8. Original address token pair
     # --------------------------------------------------------
 
     address_pair = _address_pair_key(
@@ -854,6 +1232,27 @@ def generate_block_keys(
             "country_address_pair::"
             f"{country}::{address_pair}"
         )
+
+    # --------------------------------------------------------
+    # 8b. Multiple address-token pairs
+    # --------------------------------------------------------
+
+    if (
+        country
+        and address_pair_frequency is not None
+    ):
+
+        rare_pairs = _rare_address_token_pairs(
+            address,
+            address_pair_frequency,
+        )
+
+        for pair in rare_pairs:
+
+            keys.add(
+                "country_address_token_pair::"
+                f"{country}::{pair}"
+            )
 
     # --------------------------------------------------------
     # 9. Rare address token
@@ -895,14 +1294,37 @@ def generate_block_keys(
                 f"{country}::{number}"
             )
 
-            # Stronger version:
-            # rare number + informative address token.
+            # Stronger number + address-token strategy.
             for token in informative_tokens[:3]:
 
                 keys.add(
                     "country_rare_address_number_token::"
                     f"{country}::{number}::{token}"
                 )
+
+    # --------------------------------------------------------
+    # 11. Rare address number + location
+    # --------------------------------------------------------
+
+    if (
+        country
+        and address_number_location_frequency
+        is not None
+    ):
+
+        rare_pairs = (
+            _rare_address_number_location_pairs(
+                row,
+                address_number_location_frequency,
+            )
+        )
+
+        for pair in rare_pairs:
+
+            keys.add(
+                "country_address_number_location::"
+                f"{country}::{pair}"
+            )
 
     return keys
 
@@ -917,11 +1339,17 @@ def build_block_index(
     address_number_frequency: Counter | None = None,
     name_token_frequency: Counter | None = None,
     name_ngram_frequency: Counter | None = None,
+    address_pair_frequency: Counter | None = None,
+    address_number_location_frequency: Counter | None = None,
+    leetspeak_name_frequency: Counter | None = None,
 ) -> Dict[str, List[str]]:
 
     _validate_columns(source_df)
 
-    # If frequencies were not supplied, calculate them here.
+    # --------------------------------------------------------
+    # Frequency statistics
+    # --------------------------------------------------------
+
     if address_token_frequency is None:
 
         address_token_frequency = (
@@ -954,6 +1382,33 @@ def build_block_index(
             )
         )
 
+    if address_pair_frequency is None:
+
+        address_pair_frequency = (
+            _build_address_pair_frequency(
+                source_df
+            )
+        )
+
+        if (address_number_location_frequency is None):
+            address_number_location_frequency = (
+                _build_address_number_location_frequency(
+                    source_df
+                    )
+                    )
+
+    if leetspeak_name_frequency is None:
+
+        leetspeak_name_frequency = (
+            _build_leetspeak_name_frequency(
+                source_df
+            )
+        )
+
+    # --------------------------------------------------------
+    # Build index
+    # --------------------------------------------------------
+
     index: Dict[str, List[str]] = defaultdict(list)
 
     for row in source_df.itertuples(
@@ -984,7 +1439,16 @@ def build_block_index(
             name_ngram_frequency=(
                 name_ngram_frequency
             ),
-        )
+            address_pair_frequency=(
+                address_pair_frequency
+            ),
+            address_number_location_frequency=(
+                address_number_location_frequency
+                ),
+                leetspeak_name_frequency=(
+                    leetspeak_name_frequency
+                    ),
+                    )
 
         for key in keys:
 
@@ -1014,7 +1478,7 @@ def generate_candidate_pairs(
         )
 
     # --------------------------------------------------------
-    # Build target-source-specific frequency statistics.
+    # Target-source-specific frequencies
     # --------------------------------------------------------
 
     address_token_frequency = (
@@ -1041,8 +1505,26 @@ def generate_candidate_pairs(
         )
     )
 
+    address_pair_frequency = (
+        _build_address_pair_frequency(
+            target_df
+        )
+    )
+
+    address_number_location_frequency = (
+        _build_address_number_location_frequency(
+            target_df
+        )
+    )
+
+    leetspeak_name_frequency = (
+        _build_leetspeak_name_frequency(
+            target_df
+            )
+            )
+
     # --------------------------------------------------------
-    # Build target block index.
+    # Build target block index
     # --------------------------------------------------------
 
     index = build_block_index(
@@ -1059,6 +1541,15 @@ def generate_candidate_pairs(
         name_ngram_frequency=(
             name_ngram_frequency
         ),
+        address_pair_frequency=(
+            address_pair_frequency
+        ),
+        address_number_location_frequency=(
+            address_number_location_frequency
+        ),
+        leetspeak_name_frequency=(
+            leetspeak_name_frequency
+        ),
     )
 
     candidates: Set[
@@ -1066,7 +1557,7 @@ def generate_candidate_pairs(
     ] = set()
 
     # --------------------------------------------------------
-    # Generate candidates from Source 1.
+    # Generate candidates from Source 1
     # --------------------------------------------------------
 
     for row in source1_df.itertuples(
@@ -1096,6 +1587,15 @@ def generate_candidate_pairs(
             ),
             name_ngram_frequency=(
                 name_ngram_frequency
+            ),
+            address_pair_frequency=(
+                address_pair_frequency
+            ),
+            address_number_location_frequency=(
+                address_number_location_frequency
+            ),
+            leetspeak_name_frequency=(
+                leetspeak_name_frequency
             ),
         )
 
