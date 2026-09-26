@@ -72,33 +72,63 @@ def calculate_blocking_recall(
     ground_truth: pd.DataFrame,
 ) -> dict:
     """
-    Calculate blocking recall.
+    Calculate blocking recall in chunks, without ever building a
+    Python set out of the (potentially huge) candidate_pairs frame.
 
-    Recall =
-        recovered true pairs
-        -------------------
-        total true pairs
+    Ground truth is small, so we tag each truth row with an index,
+    merge each chunk of candidates against it, and record which
+    truth indices got matched. This avoids constructing tens of
+    millions of Python tuples for large candidate sets.
     """
 
-    candidate_set = set(
+    truth = (
+        ground_truth[["source1_entity_id", "candidate_entity_id"]]
+        .astype(str)
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    truth["_truth_idx"] = truth.index
+
+    total_true = len(truth)
+
+    if total_true == 0:
+        return {
+            "total_true_pairs": 0,
+            "recovered_pairs": 0,
+            "missed_pairs": 0,
+            "blocking_recall": 0.0,
+            "candidate_pairs": len(candidate_pairs),
+            "_missed_pair_ids": set(),
+        }
+
+    recovered_indices: set[int] = set()
+    chunk_size = 2_000_000
+
+    for start in range(0, len(candidate_pairs), chunk_size):
+        chunk = candidate_pairs.iloc[start:start + chunk_size][
+            ["source1_entity_id", "candidate_entity_id"]
+        ].astype(str)
+
+        matched = truth.merge(
+            chunk,
+            on=["source1_entity_id", "candidate_entity_id"],
+            how="inner",
+        )
+
+        recovered_indices.update(matched["_truth_idx"].tolist())
+
+        if len(recovered_indices) == total_true:
+            break
+
+    recovered_count = len(recovered_indices)
+
+    missed_mask = ~truth["_truth_idx"].isin(recovered_indices)
+    missed_pair_ids = set(
         zip(
-            candidate_pairs["source1_entity_id"].astype(str),
-            candidate_pairs["candidate_entity_id"].astype(str),
+            truth.loc[missed_mask, "source1_entity_id"],
+            truth.loc[missed_mask, "candidate_entity_id"],
         )
     )
-
-    truth_set = set(
-        zip(
-            ground_truth["source1_entity_id"].astype(str),
-            ground_truth["candidate_entity_id"].astype(str),
-        )
-    )
-
-    recovered = candidate_set.intersection(truth_set)
-    missed = truth_set - candidate_set
-
-    total_true = len(truth_set)
-    recovered_count = len(recovered)
 
     recall = (
         recovered_count / total_true
@@ -109,12 +139,12 @@ def calculate_blocking_recall(
     return {
         "total_true_pairs": total_true,
         "recovered_pairs": recovered_count,
-        "missed_pairs": len(missed),
+        "missed_pairs": len(missed_pair_ids),
         "blocking_recall": recall,
-        "candidate_pairs": len(candidate_set),
+        "candidate_pairs": len(candidate_pairs),
 
         # Kept internally for diagnostic output.
-        "_missed_pair_ids": missed,
+        "_missed_pair_ids": missed_pair_ids,
     }
 
 
