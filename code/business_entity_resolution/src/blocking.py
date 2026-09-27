@@ -87,6 +87,67 @@ NAME_NGRAM_SIZE = 3
 # New controlled name-prefix rule.
 MIN_NAME_PREFIX_LENGTH = 4
 
+# ------------------------------------------------------------
+# Controlled multilingual geography fallback
+# ------------------------------------------------------------
+
+SPARSE_GEO_MAX_TOKENS = 2
+
+GEO_ALIASES = {
+    # Delhi
+    "delhi": "delhi",
+    "दिल्ली": "delhi",
+
+    # Bangalore / Bengaluru
+    "bangalore": "bangalore",
+    "bengaluru": "bangalore",
+    "ಬೆಂಗಳೂರು": "bangalore",
+
+    # Mumbai
+    "mumbai": "mumbai",
+    "bombay": "mumbai",
+    "मुंबई": "mumbai",
+
+    # Kolkata / Calcutta
+    "kolkata": "kolkata",
+    "calcutta": "kolkata",
+    "कोलकाता": "kolkata",
+
+    # Chennai
+    "chennai": "chennai",
+    "சென்னை": "chennai",
+
+    # Pune
+    "pune": "pune",
+    "पुणे": "pune",
+
+    # Maharashtra
+    "maharashtra": "maharashtra",
+    "महाराष्ट्र": "maharashtra",
+
+    # Karnataka
+    "karnataka": "karnataka",
+    "ಕರ್ನಾಟಕ": "karnataka",
+
+    # Haryana
+    "haryana": "haryana",
+    "हरियाणा": "haryana",
+
+    # Hyderabad / Telangana
+    "hyderabad": "hyderabad",
+    "हैदराबाद": "hyderabad",
+
+    "telangana": "telangana",
+    "तेलंगाना": "telangana",
+
+    # Tamil Nadu
+    "tamil": "tamil",
+    "தமிழ்": "tamil",
+
+    # Gurgaon / Gurugram
+    "gurgaon": "gurgaon",
+    "gurugram": "gurgaon",
+}
 
 # ============================================================
 # Generic address tokens
@@ -662,9 +723,7 @@ def _build_address_number_frequency(
         index=False
     ):
 
-        row_series = pd.Series(
-            row._asdict()
-        )
+        row_series = row._asdict()
 
         numbers = _address_base_numbers(
             row_series
@@ -706,9 +765,7 @@ def _build_address_number_location_frequency(
         index=False
     ):
 
-        row_series = pd.Series(
-            row._asdict()
-        )
+        row_series = row._asdict()
 
         pairs = _address_number_location_pairs(
             row_series
@@ -727,7 +784,7 @@ def _build_address_number_suffix_frequency(
     frequency = Counter()
 
     for row in target_df.itertuples(index=False):
-        row_series = pd.Series(row._asdict())
+        row_series = row._asdict()
 
         numbers = _address_numbers(row_series)
 
@@ -1697,6 +1754,76 @@ def generate_block_keys(
 
     return keys
 
+def _canonical_geography_tokens(
+    address: object,
+) -> Set[str]:
+    """
+    Return controlled geography tokens from an address.
+
+    Only explicitly recognized geography aliases are returned.
+    """
+
+    result: Set[str] = set()
+
+    for token in _tokens(address):
+        token = token.casefold()
+
+        canonical = GEO_ALIASES.get(token)
+
+        if canonical:
+            result.add(canonical)
+
+    return result
+
+def _build_sparse_geography_index(
+    target_df: pd.DataFrame,
+) -> Dict[str, List[str]]:
+    """
+    Secondary recall index for sparse target addresses.
+
+    Only target rows with <=2 informative address tokens are
+    included. This prevents common geography tokens from
+    becoming a global high-frequency blocking key.
+    """
+
+    index: Dict[str, List[str]] = defaultdict(list)
+
+    for row in target_df.itertuples(index=False):
+
+        row_dict = row._asdict()
+
+        address = row_dict.get(
+            "address_normalized",
+            "",
+        )
+
+        informative_tokens = (
+            _informative_address_tokens(address)
+        )
+
+        if not informative_tokens:
+            continue
+
+        if len(informative_tokens) > SPARSE_GEO_MAX_TOKENS:
+            continue
+
+        geographies = _canonical_geography_tokens(
+            address
+        )
+
+        if not geographies:
+            continue
+
+        entity_id = str(
+            row_dict["entity_id"]
+        )
+
+        for geography in geographies:
+            index[
+                f"sparse_geo::{geography}"
+            ].append(entity_id)
+
+    return dict(index)
 
 # ============================================================
 # Block index
@@ -1807,9 +1934,7 @@ def build_block_index(
             row_dict["entity_id"]
         )
 
-        row_series = pd.Series(
-            row_dict
-        )
+        row_series = row_dict
 
         keys = generate_block_keys(
             row_series,
@@ -1962,6 +2087,10 @@ def generate_candidate_pairs(
         ),
     )
 
+    sparse_geo_index = _build_sparse_geography_index(
+        target_df
+    )
+
     candidates: Set[
         tuple[str, str, str]
     ] = set()
@@ -1980,9 +2109,7 @@ def generate_candidate_pairs(
             row_dict["entity_id"]
         )
 
-        row_series = pd.Series(
-            row_dict
-        )
+        row_series = row_dict
 
         keys = generate_block_keys(
             row_series,
@@ -2051,6 +2178,36 @@ def generate_candidate_pairs(
                     normal_candidates.add(
                         candidate_id
                     )
+                    
+        # ----------------------------------------------------
+        # Third pass: sparse multilingual geography fallback
+        #
+        # Independent of the normal candidate count.
+        # Only target rows with <=2 informative address
+        # tokens are present in this secondary index.
+        # ----------------------------------------------------
+
+        s1_geographies = _canonical_geography_tokens(
+            row_series.get(
+                "address_normalized",
+                "",
+            )
+        )
+
+        for geography in s1_geographies:
+
+            sparse_key = (
+                f"sparse_geo::{geography}"
+            )
+
+            for candidate_id in sparse_geo_index.get(
+                sparse_key,
+                [],
+            ):
+                normal_candidates.add(
+                    candidate_id
+                )
+
 
         # ----------------------------------------------------
         # Store candidates
