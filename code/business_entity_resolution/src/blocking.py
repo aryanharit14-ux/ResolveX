@@ -24,7 +24,6 @@ REQUIRED_COLUMNS = [
     "name_normalized",
     "name_core",
     "address_normalized",
-    "country_normalized",
 ]
 
 OPTIONAL_COLUMNS = [
@@ -883,52 +882,51 @@ def _final_recall_keys(
     """
     Final high-recall blocking keys.
 
-    These keys are intentionally broad and are only used with
-    frequency limits in generate_block_keys().
+    These keys are intentionally broad. They should be filtered by
+    target-side frequency statistics before being added to the
+    blocking index.
     """
     keys: set[str] = set()
 
-    # ---------------------------------------------------------
-    # 1. Individual meaningful name tokens
-    #    Helps:
-    #    OV Foods <-> OV Private Foods
-    #    NS Consulting <-> NS Corp Consulting
-    #    QR Brothers <-> QR Private Limited Services
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Name tokens
+    # -----------------------------
     name_tokens = {
-        token
-        for token in re.findall(r"[^\W\d_]+", name_core or name, flags=re.UNICODE)
+        token.casefold()
+        for token in re.findall(
+            r"[^\\W\\d_]+",
+            name_core or name,
+            flags=re.UNICODE,
+        )
         if len(token) >= MIN_NAME_TOKEN_LENGTH
     }
 
     for token in name_tokens:
-        keys.add(f"final_name_token:{token}")
+        keys.add(f"final_name_token::{token}")
 
-    # ---------------------------------------------------------
-    # 2. Character trigrams from the complete normalized name
-    #    Helps small spelling/transposition errors.
-    # ---------------------------------------------------------
-    compact_name = re.sub(
-        r"[^\w]",
-        "",
-        _accent_fold_name(name_core or name),
-        flags=re.UNICODE,
+    # -----------------------------
+    # Name trigrams
+    # -----------------------------
+    compact_name = _accent_fold_name(
+        name_core or name
     )
 
-    if len(compact_name) >= 4:
-        for i in range(len(compact_name) - 2):
-            keys.add(
-                f"final_name_tri:{compact_name[i:i + 3]}"
-            )
+    if len(compact_name) >= NAME_NGRAM_SIZE:
+        for i in range(
+            len(compact_name) - NAME_NGRAM_SIZE + 1
+        ):
+            ngram = compact_name[
+                i:i + NAME_NGRAM_SIZE
+            ]
+            keys.add(f"final_name_ngram::{ngram}")
 
-    # ---------------------------------------------------------
-    # 3. Address tokens
-    #    Helps multilingual names where address is the bridge.
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Address tokens
+    # -----------------------------
     address_tokens = {
-        token
+        token.casefold()
         for token in re.findall(
-            r"[^\W\d_]+",
+            r"[^\\W\\d_]+",
             address_normalized or "",
             flags=re.UNICODE,
         )
@@ -936,35 +934,155 @@ def _final_recall_keys(
     }
 
     for token in address_tokens:
-        keys.add(f"final_address_token:{token}")
+        keys.add(f"final_address_token::{token}")
 
-    # ---------------------------------------------------------
-    # 4. Numeric address fragments
-    #    Handles:
-    #       408 <-> 08
-    #       1410 <-> 14-10
-    #       207 2nd <-> 207 2th
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Address numbers
+    # -----------------------------
     numbers = re.findall(
-        r"\d+[a-zA-Z]?",
+        r"\\d+[a-zA-Z]?",
         address_normalized or "",
     )
 
     for number in numbers:
-        number = number.lower()
+        number = number.casefold()
 
-        keys.add(f"final_address_number:{number}")
+        digits = re.sub(
+            r"[^0-9]",
+            "",
+            number,
+        )
 
-        digits = re.sub(r"[^0-9]", "", number)
+        if not digits:
+            continue
 
-        if len(digits) >= 2:
+        keys.add(
+            f"final_address_number::{digits}"
+        )
+
+    return keys
+
+
+def _filtered_final_recall_keys(
+    name_core: str,
+    name: str,
+    address_normalized: str,
+    name_token_frequency: Counter,
+    name_ngram_frequency: Counter,
+    address_token_frequency: Counter,
+    address_number_frequency: Counter,
+) -> set[str]:
+    """
+    Generate high-recall fallback keys while filtering them using
+    target-side frequency statistics to prevent candidate explosion.
+    """
+    keys: set[str] = set()
+
+    # -----------------------------
+    # Name tokens
+    # -----------------------------
+    name_tokens = {
+        token.casefold()
+        for token in re.findall(
+            r"[^\\W\\d_]+",
+            name_core or name,
+            flags=re.UNICODE,
+        )
+        if len(token) >= MIN_NAME_TOKEN_LENGTH
+    }
+
+    for token in name_tokens:
+        if (
+            name_token_frequency.get(
+                token,
+                0,
+            )
+            <= MAX_RARE_NAME_TOKEN_FREQUENCY
+        ):
             keys.add(
-                f"final_address_number_suffix:{digits[-2:]}"
+                f"final_name_token::{token}"
             )
 
-        if len(digits) >= 3:
+    # -----------------------------
+    # Name trigrams
+    # -----------------------------
+    compact_name = _accent_fold_name(
+        name_core or name
+    )
+
+    if len(compact_name) >= NAME_NGRAM_SIZE:
+        for i in range(
+            len(compact_name) - NAME_NGRAM_SIZE + 1
+        ):
+            ngram = compact_name[
+                i:i + NAME_NGRAM_SIZE
+            ]
+
+            if (
+                name_ngram_frequency.get(
+                    ngram,
+                    0,
+                )
+                <= MAX_RARE_NAME_NGRAM_FREQUENCY
+            ):
+                keys.add(
+                    f"final_name_ngram::{ngram}"
+                )
+
+    # -----------------------------
+    # Address tokens
+    # -----------------------------
+    address_tokens = {
+        token.casefold()
+        for token in re.findall(
+            r"[^\\W\\d_]+",
+            address_normalized or "",
+            flags=re.UNICODE,
+        )
+        if len(token) >= MIN_ADDRESS_TOKEN_LENGTH
+    }
+
+    for token in address_tokens:
+        if (
+            address_token_frequency.get(
+                token,
+                0,
+            )
+            <= MAX_FINAL_ADDRESS_TOKEN_BLOCK_FREQUENCY
+        ):
             keys.add(
-                f"final_address_number_suffix:{digits[-3:]}"
+                f"final_address_token::{token}"
+            )
+
+    # -----------------------------
+    # Address numbers
+    # -----------------------------
+    numbers = re.findall(
+        r"\\d+[a-zA-Z]?",
+        address_normalized or "",
+    )
+
+    for number in numbers:
+        number = number.casefold()
+
+        digits = re.sub(
+            r"[^0-9]",
+            "",
+            number,
+        )
+
+        if not digits:
+            continue
+
+        if (
+            address_number_frequency.get(
+                digits,
+                0,
+            )
+            <= MAX_RARE_ADDRESS_NUMBER_FREQUENCY
+        ):
+            keys.add(
+                f"final_address_number::{digits}"
             )
 
     return keys
@@ -982,14 +1100,8 @@ def generate_block_keys(
     address_pair_frequency: Counter | None = None,
     address_number_location_frequency: Counter | None = None,
     leetspeak_name_frequency: Counter | None = None,
+    final_recall_enabled: bool = True,
 ) -> Set[str]:
-
-    country = _safe_string(
-        row.get(
-            "country_normalized",
-            "",
-        )
-    )
 
     name = _safe_string(
         row.get(
@@ -1024,11 +1136,6 @@ def generate_block_keys(
 
     if name:
 
-        if country:
-            keys.add(
-                f"country_name::{country}::{name}"
-            )
-
         keys.add(
             f"name::{name}"
         )
@@ -1038,11 +1145,6 @@ def generate_block_keys(
     # --------------------------------------------------------
 
     if name_core:
-
-        if country:
-            keys.add(
-                f"country_core::{country}::{name_core}"
-            )
 
         keys.add(
             f"core::{name_core}"
@@ -1056,10 +1158,9 @@ def generate_block_keys(
         name_core or name
     )
 
-    if country and token_key:
-
+    if token_key:
         keys.add(
-            f"country_name_tokens::{country}::{token_key}"
+            f"name_tokens::{token_key}"
         )
 
     # --------------------------------------------------------
@@ -1070,10 +1171,9 @@ def generate_block_keys(
         name_core or name
     )
 
-    if country and name_prefix:
-
+    if name_prefix:
         keys.add(
-            f"country_name_prefix::{country}::{name_prefix}"
+            f"name_prefix::{name_prefix}"
         )
 
     # --------------------------------------------------------
@@ -1084,10 +1184,9 @@ def generate_block_keys(
         name_core or name
     )
 
-    if country and name_subset:
-
+    if name_subset:
         keys.add(
-            f"country_name_subset::{country}::{name_subset}"
+            f"name_subset::{name_subset}"
         )
 
     # --------------------------------------------------------
@@ -1098,20 +1197,16 @@ def generate_block_keys(
         name_core or name
     )
 
-    if country and accent_name:
-
+    if accent_name:
         keys.add(
-            f"country_accent_name::{country}::{accent_name}"
+            f"accent_name::{accent_name}"
         )
 
     # --------------------------------------------------------
     # 4b. Controlled leetspeak-normalized name
     # --------------------------------------------------------
 
-    if (
-        country
-        and leetspeak_name_frequency is not None
-    ):
+    if leetspeak_name_frequency is not None:
 
         leet_name = _leetspeak_name(
             name_core or name
@@ -1126,18 +1221,14 @@ def generate_block_keys(
         ):
 
             keys.add(
-                "country_leetspeak_name::"
-                f"{country}::{leet_name}"
+                f"leetspeak_name::{leet_name}"
             )
 
     # --------------------------------------------------------
     # 5. Rare individual name tokens
     # --------------------------------------------------------
 
-    if (
-        country
-        and name_token_frequency is not None
-    ):
+    if name_token_frequency is not None:
 
         rare_tokens = _rare_name_tokens(
             name_core or name,
@@ -1147,18 +1238,14 @@ def generate_block_keys(
         for token in rare_tokens:
 
             keys.add(
-                "country_rare_name_token::"
-                f"{country}::{token}"
+                f"rare_name_token::{token}"
             )
 
     # --------------------------------------------------------
     # 6. Rare character n-grams
     # --------------------------------------------------------
 
-    if (
-        country
-        and name_ngram_frequency is not None
-    ):
+    if name_ngram_frequency is not None:
 
         rare_ngrams = _rare_name_ngrams(
             name_core or name,
@@ -1168,8 +1255,7 @@ def generate_block_keys(
         for ngram in rare_ngrams:
 
             keys.add(
-                "country_name_ngram::"
-                f"{country}::{ngram}"
+                f"name_ngram::{ngram}"
             )
 
     # ========================================================
@@ -1194,29 +1280,25 @@ def generate_block_keys(
     # 7. Address number + token
     # --------------------------------------------------------
 
-    if country:
+    for number in address_numbers:
 
-        for number in address_numbers:
+        for token in informative_tokens[:3]:
 
-            for token in informative_tokens[:3]:
+            keys.add(
+                f"address_number_token::{number}::{token}"
+            )
 
-                keys.add(
-                    "country_address_number_token::"
-                    f"{country}::{number}::{token}"
-                )
+    # ----------------------------------------------------
+    # Base number + token
+    # ----------------------------------------------------
 
-        # ----------------------------------------------------
-        # Base number + token
-        # ----------------------------------------------------
+    for base_number in address_base_numbers:
 
-        for base_number in address_base_numbers:
+        for token in informative_tokens[:3]:
 
-            for token in informative_tokens[:3]:
-
-                keys.add(
-                    "country_address_base_number_token::"
-                    f"{country}::{base_number}::{token}"
-                )
+            keys.add(
+                f"address_base_number_token::{base_number}::{token}"
+            )
 
     # --------------------------------------------------------
     # 8. Original address token pair
@@ -1226,21 +1308,16 @@ def generate_block_keys(
         address
     )
 
-    if country and address_pair:
-
+    if address_pair:
         keys.add(
-            "country_address_pair::"
-            f"{country}::{address_pair}"
+            f"address_pair::{address_pair}"
         )
 
     # --------------------------------------------------------
     # 8b. Multiple address-token pairs
     # --------------------------------------------------------
 
-    if (
-        country
-        and address_pair_frequency is not None
-    ):
+    if address_pair_frequency is not None:
 
         rare_pairs = _rare_address_token_pairs(
             address,
@@ -1250,18 +1327,14 @@ def generate_block_keys(
         for pair in rare_pairs:
 
             keys.add(
-                "country_address_token_pair::"
-                f"{country}::{pair}"
+                f"address_token_pair::{pair}"
             )
 
     # --------------------------------------------------------
     # 9. Rare address token
     # --------------------------------------------------------
 
-    if (
-        country
-        and address_token_frequency is not None
-    ):
+    if address_token_frequency is not None:
 
         for token in _rare_address_tokens(
             address,
@@ -1269,18 +1342,14 @@ def generate_block_keys(
         ):
 
             keys.add(
-                "country_rare_address_token::"
-                f"{country}::{token}"
+                f"rare_address_token::{token}"
             )
 
     # --------------------------------------------------------
     # 10. Rare address number
     # --------------------------------------------------------
 
-    if (
-        country
-        and address_number_frequency is not None
-    ):
+    if address_number_frequency is not None:
 
         rare_numbers = _rare_address_numbers(
             row,
@@ -1290,27 +1359,21 @@ def generate_block_keys(
         for number in rare_numbers:
 
             keys.add(
-                "country_rare_address_number::"
-                f"{country}::{number}"
+                f"rare_address_number::{number}"
             )
 
             # Stronger number + address-token strategy.
             for token in informative_tokens[:3]:
 
                 keys.add(
-                    "country_rare_address_number_token::"
-                    f"{country}::{number}::{token}"
+                    f"rare_address_number_token::{number}::{token}"
                 )
 
     # --------------------------------------------------------
     # 11. Rare address number + location
     # --------------------------------------------------------
 
-    if (
-        country
-        and address_number_location_frequency
-        is not None
-    ):
+    if address_number_location_frequency is not None:
 
         rare_pairs = (
             _rare_address_number_location_pairs(
@@ -1322,9 +1385,31 @@ def generate_block_keys(
         for pair in rare_pairs:
 
             keys.add(
-                "country_address_number_location::"
-                f"{country}::{pair}"
+                f"address_number_location::{pair}"
             )
+
+    # ========================================================
+    # FINAL HIGH-RECALL FALLBACK
+    # ========================================================
+
+    if (
+        final_recall_enabled
+        and name_token_frequency is not None
+        and name_ngram_frequency is not None
+        and address_token_frequency is not None
+        and address_number_frequency is not None
+    ):
+        final_keys = _filtered_final_recall_keys(
+            name_core=name_core,
+            name=name,
+            address_normalized=address,
+            name_token_frequency=name_token_frequency,
+            name_ngram_frequency=name_ngram_frequency,
+            address_token_frequency=address_token_frequency,
+            address_number_frequency=address_number_frequency,
+        )
+
+        keys.update(final_keys)
 
     return keys
 
