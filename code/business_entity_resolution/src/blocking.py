@@ -58,6 +58,24 @@ MAX_LEETSPEAK_NAME_FREQUENCY = 150
 MAX_GEOGRAPHIC_PAIR_FREQUENCY = 700
 
 # ------------------------------------------------------------
+# Controlled fallback blocking
+# ------------------------------------------------------------
+
+MAX_FALLBACK_LOCATION_TOKEN_FREQUENCY = 300
+MAX_FALLBACK_NAME_TOKEN_FREQUENCY = 300
+MAX_FALLBACK_ADDRESS_NUMBER_SUFFIX_FREQUENCY = 100
+
+
+FALLBACK_NUMBER_SUFFIX_LENGTHS = (2, 3)
+
+# ------------------------------------------------------------
+# Difficult-record fallback
+# ------------------------------------------------------------
+
+MAX_DIFFICULT_LOCATION_TOKENS = 2
+MAX_DIFFICULT_NAME_TOKENS = 2
+
+# ------------------------------------------------------------
 # Name frequency limits
 # ------------------------------------------------------------
 
@@ -702,6 +720,28 @@ def _build_address_number_location_frequency(
     return frequency
 
 
+
+def _build_address_number_suffix_frequency(
+    target_df: pd.DataFrame,
+) -> Counter:
+    frequency = Counter()
+
+    for row in target_df.itertuples(index=False):
+        row_series = pd.Series(row._asdict())
+
+        numbers = _address_numbers(row_series)
+
+        for number in numbers:
+            digits = re.sub(r"[^0-9]", "", number)
+
+            for length in FALLBACK_NUMBER_SUFFIX_LENGTHS:
+                if len(digits) >= length:
+                    suffix = digits[-length:]
+                    frequency[suffix] += 1
+
+    return frequency
+
+
 # ============================================================
 # Name frequency
 # ============================================================
@@ -1024,6 +1064,122 @@ def _final_recall_keys(
 # Blocking key generation
 # ============================================================
 
+
+def _difficult_fallback_keys(
+    row: pd.Series,
+) -> Set[str]:
+    """
+    Additional conservative blocking keys for difficult records.
+
+    These keys are based on combinations of:
+      - country + location token pair
+      - country + name token pair
+      - country + address number + location token
+
+    The purpose is to recover records where the normal blocking
+    strategies fail because the name is multilingual, reordered,
+    abbreviated, or the address number differs slightly.
+    """
+
+    keys: Set[str] = set()
+
+    country = _safe_string(
+        row.get("country_normalized", "")
+    )
+
+    if not country:
+        return keys
+
+    name = _safe_string(
+        row.get("name_core", "")
+        or row.get("name_normalized", "")
+    )
+
+    address = _safe_string(
+        row.get("address_normalized", "")
+    )
+
+    # --------------------------------------------------------
+    # 1. Country + strongest location pair
+    # --------------------------------------------------------
+
+    location_tokens = _informative_address_tokens(address)
+
+    if len(location_tokens) >= 2:
+        selected_locations = location_tokens[
+            :MAX_DIFFICULT_LOCATION_TOKENS
+        ]
+
+        location_pair = "|".join(
+            sorted(set(selected_locations))
+        )
+
+        if location_pair:
+            keys.add(
+                "difficult_country_location_pair::"
+                f"{country}::{location_pair}"
+            )
+
+    # --------------------------------------------------------
+    # 2. Country + name token pair
+    # --------------------------------------------------------
+
+    name_tokens = _informative_name_tokens(name)
+
+    if len(name_tokens) >= 2:
+        selected_name_tokens = name_tokens[
+            :MAX_DIFFICULT_NAME_TOKENS
+        ]
+
+        name_pair = "|".join(
+            sorted(set(
+                token.casefold()
+                for token in selected_name_tokens
+            ))
+        )
+
+        if name_pair:
+            keys.add(
+                "difficult_country_name_pair::"
+                f"{country}::{name_pair}"
+            )
+
+    # --------------------------------------------------------
+    # 3. Country + address number + location
+    # --------------------------------------------------------
+
+    numbers = _address_base_numbers(row)
+
+    for number in numbers:
+        for location in location_tokens[:2]:
+            keys.add(
+                "difficult_country_number_location::"
+                f"{country}::{number}::{location}"
+            )
+
+    # --------------------------------------------------------
+    # 4. Country + address suffix + location
+    # --------------------------------------------------------
+
+    for number in numbers:
+        digits = re.sub(
+            r"[^0-9]",
+            "",
+            number,
+        )
+
+        if len(digits) >= 2:
+            suffix = digits[-2:]
+
+            for location in location_tokens[:2]:
+                keys.add(
+                    "difficult_country_suffix_location::"
+                    f"{country}::{suffix}::{location}"
+                )
+
+    return keys
+
+
 def generate_block_keys(
     row: pd.Series,
     address_token_frequency: Counter | None = None,
@@ -1034,6 +1190,7 @@ def generate_block_keys(
     address_pair_frequency: Counter | None = None,
     address_number_location_frequency: Counter | None = None,
     leetspeak_name_frequency: Counter | None = None,
+    address_number_suffix_frequency: Counter | None = None,
     
 ) -> Set[str]:
 
@@ -1401,6 +1558,143 @@ def generate_block_keys(
                 f"{country}::{pair}"
             )
 
+
+    # ========================================================
+    # CONTROLLED FALLBACK BLOCKING
+    # ========================================================
+
+    # --------------------------------------------------------
+    # F1. Country + individual location token
+    #
+    # Useful for cross-script names where the address
+    # provides the bridge.
+    # --------------------------------------------------------
+
+    if (
+        country
+        and address_token_frequency is not None
+    ):
+        fallback_location_tokens = []
+
+        for token in informative_tokens:
+            frequency = address_token_frequency.get(
+                token,
+                0,
+            )
+
+            if (
+                frequency > 0
+                and frequency <= MAX_FALLBACK_LOCATION_TOKEN_FREQUENCY
+            ):
+                fallback_location_tokens.append(token)
+
+        for token in fallback_location_tokens:
+            keys.add(
+                "fallback_country_location::"
+                f"{country}::{token}"
+            )
+
+    # --------------------------------------------------------
+    # F2. Country + two location tokens
+    # --------------------------------------------------------
+
+    if (
+        country
+        and address_pair_frequency is not None
+    ):
+        fallback_pairs = _address_token_pairs(address)
+
+        for pair in fallback_pairs:
+            frequency = address_pair_frequency.get(
+                pair,
+                0,
+            )
+
+            if (
+                frequency > 0
+                and frequency <= MAX_GEOGRAPHIC_PAIR_FREQUENCY
+            ):
+                keys.add(
+                    "fallback_country_location_pair::"
+                    f"{country}::{pair}"
+                )
+
+    # --------------------------------------------------------
+    # F3. Country + partial/individual name token
+    # --------------------------------------------------------
+
+    if (
+        country
+        and name_token_frequency is not None
+    ):
+        fallback_name_tokens = _informative_name_tokens(
+            name_core or name
+        )
+
+        for token in set(fallback_name_tokens):
+            normalized_token = token.casefold()
+
+            if len(normalized_token) < MIN_NAME_TOKEN_LENGTH:
+                continue
+
+            frequency = name_token_frequency.get(
+                normalized_token,
+                0,
+            )
+
+            if (
+                frequency > 0
+                and frequency <= MAX_FALLBACK_NAME_TOKEN_FREQUENCY
+            ):
+                keys.add(
+                    "fallback_country_name_token::"
+                    f"{country}::{normalized_token}"
+                )
+
+    # --------------------------------------------------------
+    # F4. Country + address-number suffix
+    # --------------------------------------------------------
+
+    if (
+        country
+        and address_number_suffix_frequency is not None
+    ):
+        for number in address_numbers:
+            digits = re.sub(
+                r"[^0-9]",
+                "",
+                number,
+            )
+
+            for length in FALLBACK_NUMBER_SUFFIX_LENGTHS:
+                if len(digits) < length:
+                    continue
+
+                suffix = digits[-length:]
+
+                frequency = address_number_suffix_frequency.get(
+                    suffix,
+                    0,
+                )
+
+                if (
+                    frequency > 0
+                    and frequency
+                    <= MAX_FALLBACK_ADDRESS_NUMBER_SUFFIX_FREQUENCY
+                ):
+                    keys.add(
+                        "fallback_country_number_suffix::"
+                        f"{country}::{suffix}"
+                    )
+
+    # --------------------------------------------------------
+    # DIFFICULT-RECORD FALLBACK
+    # --------------------------------------------------------
+
+    keys.update(
+        _difficult_fallback_keys(row)
+    )
+
     return keys
 
 
@@ -1418,6 +1712,7 @@ def build_block_index(
     address_pair_frequency: Counter | None = None,
     address_number_location_frequency: Counter | None = None,
     leetspeak_name_frequency: Counter | None = None,
+    address_number_suffix_frequency: Counter | None = None,
 ) -> Dict[str, List[str]]:
 
     _validate_columns(source_df)
@@ -1489,6 +1784,13 @@ def build_block_index(
             )
         )
 
+    if address_number_suffix_frequency is None:
+        address_number_suffix_frequency = (
+            _build_address_number_suffix_frequency(
+                source_df
+            )
+        )
+
     # --------------------------------------------------------
     # Build index
     # --------------------------------------------------------
@@ -1535,7 +1837,10 @@ def build_block_index(
                 leetspeak_name_frequency=(
                     leetspeak_name_frequency
                     ),
-                    )
+                        address_number_suffix_frequency=(
+                address_number_suffix_frequency
+            ),
+        )
 
         for key in keys:
 
@@ -1616,6 +1921,12 @@ def generate_candidate_pairs(
             )
             )
 
+    address_number_suffix_frequency = (
+        _build_address_number_suffix_frequency(
+            target_df
+        )
+    )
+
     # --------------------------------------------------------
     # Build target block index
     # --------------------------------------------------------
@@ -1645,6 +1956,9 @@ def generate_candidate_pairs(
         ),
         leetspeak_name_frequency=(
             leetspeak_name_frequency
+        ),
+        address_number_suffix_frequency=(
+            address_number_suffix_frequency
         ),
     )
 
@@ -1696,22 +2010,60 @@ def generate_candidate_pairs(
             leetspeak_name_frequency=(
                 leetspeak_name_frequency
             ),
+            address_number_suffix_frequency=(
+                address_number_suffix_frequency
+            ),
         )
 
-        for key in keys:
+        # ----------------------------------------------------
+        # First pass: normal blocking
+        # ----------------------------------------------------
 
+        normal_candidates = set()
+
+        for key in keys:
             for candidate_id in index.get(
                 key,
                 [],
             ):
-
-                candidates.add(
-                    (
-                        s1_id,
-                        candidate_id,
-                        target_source,
-                    )
+                normal_candidates.add(
+                    candidate_id
                 )
+
+        # ----------------------------------------------------
+        # Second pass: difficult fallback
+        #
+        # Only activate when normal blocking produces
+        # no candidates or an unusually small candidate set.
+        # ----------------------------------------------------
+
+        if len(normal_candidates) <= 3:
+
+            fallback_keys = _difficult_fallback_keys(
+                row_series
+            )
+
+            for key in fallback_keys:
+                for candidate_id in index.get(
+                    key,
+                    [],
+                ):
+                    normal_candidates.add(
+                        candidate_id
+                    )
+
+        # ----------------------------------------------------
+        # Store candidates
+        # ----------------------------------------------------
+
+        for candidate_id in normal_candidates:
+            candidates.add(
+                (
+                    s1_id,
+                    candidate_id,
+                    target_source,
+                )
+            )
 
     result = pd.DataFrame(
         list(candidates),
